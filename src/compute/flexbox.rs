@@ -387,6 +387,31 @@ fn compute_preliminary(tree: &mut impl LayoutFlexboxContainer, node: NodeId, inp
     debug_log!("determine_available_space");
     let available_space = determine_available_space(known_dimensions, available_space, &constants);
 
+    // If only the width of a single-line column container has been requested then it is the largest of its items'
+    // hypothetical outer widths. Each is measured at the height the item's own style gives it, if any, rather
+    // than at the height it flexes to, which only an aspect ratio transfers to its width.
+    // This avoids measuring the height of every item.
+    // See https://www.w3.org/TR/css-flexbox-1/#intrinsic-cross-sizes
+    if run_mode == RunMode::ComputeSize
+        && inputs.axis == RequestedAxis::Horizontal
+        && constants.is_column
+        && !constants.is_wrap
+        && flex_items.iter().all(|item| item.aspect_ratio.is_none())
+    {
+        if let Some(inner_main_size) = constants.node_inner_size.main(constants.dir) {
+            let outer_main_size = inner_main_size + constants.content_box_inset.main_axis_sum(constants.dir);
+            constants.container_size.set_main(constants.dir, outer_main_size);
+        }
+        let mut flex_lines = collect_flex_lines(&constants, available_space, &mut flex_items);
+        for line in &mut flex_lines {
+            determine_hypothetical_cross_size(tree, line, &constants, known_dimensions, available_space, false);
+        }
+        calculate_cross_size(&mut flex_lines, known_dimensions, &constants);
+        let _total_line_cross_size = determine_container_cross_size(&flex_lines, known_dimensions, &mut constants);
+        let size = Size::ZERO.with_cross(constants.dir, constants.container_size.cross(constants.dir));
+        return LayoutOutput::from_outer_size(size);
+    }
+
     // 3. Determine the flex base size and hypothetical main size of each item.
     debug_log!("determine_flex_base_size");
     determine_flex_base_size(tree, &constants, available_space, &mut flex_items);
@@ -461,7 +486,7 @@ fn compute_preliminary(tree: &mut impl LayoutFlexboxContainer, node: NodeId, inp
     // 7. Determine the hypothetical cross size of each item.
     debug_log!("determine_hypothetical_cross_size");
     for line in &mut flex_lines {
-        determine_hypothetical_cross_size(tree, line, &constants, known_dimensions, available_space);
+        determine_hypothetical_cross_size(tree, line, &constants, known_dimensions, available_space, true);
     }
 
     // Calculate child baselines. This function is internally smart and only computes child baselines
@@ -2006,6 +2031,7 @@ fn determine_hypothetical_cross_size(
     constants: &AlgoConstants,
     node_size: Size<Option<f32>>,
     available_space: Size<AvailableSpace>,
+    main_sizes_are_resolved: bool,
 ) {
     // If the flex container is single-line and has a definite cross size then that is the cross size of the
     // line, whatever the hypothetical cross sizes of the items are
@@ -2024,9 +2050,24 @@ fn determine_hypothetical_cross_size(
             continue;
         }
 
-        // The available space passed to the child excludes the child's margins
-        let child_available_main =
-            (constants.container_size.main(constants.dir) - child.margin.main_axis_sum(constants.dir)).max(0.0).into();
+        // The main size the child is measured at, and the available space passed to it, which excludes the
+        // child's margins. Before the main sizes are resolved the child's is the one its style gives it (if any),
+        // and the container's is not known unless it was passed in: it will be large enough for the child.
+        let child_main = if main_sizes_are_resolved {
+            Some(child.target_size.main(constants.dir))
+        } else {
+            child
+                .size
+                .main(constants.dir)
+                .maybe_clamp(child.min_size.main(constants.dir), child.max_size.main(constants.dir))
+                .maybe_max((child.padding + child.border).main_axis_sum(constants.dir))
+        };
+        let child_available_main = if main_sizes_are_resolved || constants.node_inner_size.main(constants.dir).is_some()
+        {
+            (constants.container_size.main(constants.dir) - child.margin.main_axis_sum(constants.dir)).max(0.0).into()
+        } else {
+            AvailableSpace::MaxContent
+        };
 
         // Sizes transferred through the aspect ratio clamp the hypothetical cross size
         // https://github.com/w3c/csswg-drafts/issues/10997
@@ -2075,8 +2116,8 @@ fn determine_hypothetical_cross_size(
                     sizing_mode: SizingMode::ContentSize,
                     axis: constants.dir.cross_axis().into(),
                     known_dimensions: Size {
-                        width: if constants.is_row { child.target_size.width.into() } else { child_cross },
-                        height: if constants.is_row { child_cross } else { child.target_size.height.into() },
+                        width: if constants.is_row { child_main } else { child_cross },
+                        height: if constants.is_row { child_cross } else { child_main },
                     },
                     known_dimensions_are_definite: item_known_dimension_definiteness(constants, child),
                     parent_size: constants.node_inner_size,
